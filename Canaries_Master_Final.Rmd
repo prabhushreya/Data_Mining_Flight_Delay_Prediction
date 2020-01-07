@@ -1,0 +1,614 @@
+---
+title: 'Canaries in the Data Mine Master FINAL'
+author: "Alisa Hartle, Jared Kohler, Shreya Prabhu"
+date: 'Assigned: April 23, 2019'
+output:
+  html_document:
+    highlight: tango
+    theme: paper
+    toc: yes
+    toc_depth: 5
+  pdf_document:
+    toc: yes
+    toc_depth: '5'
+  word_document:
+    toc: yes
+    toc_depth: '5'
+---
+###Introduction###
+
+**This project's aim has been to explore, analyze, and attempt to predict flight delays in minutes for flights coming to and from the Pittsburgh International Airport.**
+
+###Data Processing###
+
+```{r, warning=FALSE, message=FALSE}
+library(knitr)
+knitr::opts_chunk$set(cache = TRUE, warning = FALSE, 
+                      message = FALSE, cache.lazy = FALSE)
+library(plyr)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(glmnet)
+library(readr)
+library(tree)
+
+#Government airport data is not downloadable annually, so it had to be downloaded as 12 national month files and then filtered and combined to only contain the Pittsburgh flights.
+
+# datafiles <- lapply(Sys.glob("On_Time*.csv"), read_csv)
+# 
+# month <- as.data.frame(datafiles[[1]])
+# filter_month <- filter(month,month$Origin =="PIT"|month$Dest =="PIT")
+
+# for (i in 2:12){
+  # month1 <- as.data.frame(datafiles[[i]])
+  # filter_month2 <- filter(month1,month1$Origin =="PIT"|month1$Dest =="PIT")
+  # filter_month <<- rbind(filter_month, filter_month2)
+# }
+
+# write.csv(filter_month, file = "All_PIT_2018-19.csv ")
+
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+#import Flight datasets
+flight.df<<- as.data.frame(read_csv("All_PIT_2018-19.csv",col_names=TRUE))
+
+flights.2006<-as.data.frame(read_csv("all_PIT_2006.csv",col_names=TRUE))
+
+#import Master file from the Aircraft Registry
+# MASTER <- data.frame(readr::read_csv("MASTER.txt"))
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+
+
+
+*Missing Values in Columns*
+
+```{r}
+#Omitting columns that are comprised of over 80% null values.
+#(NAs? et al., 2019)
+flight.df<-flight.df[, colSums(is.na(flight.df)) < .8*nrow(flight.df)]
+
+
+#removing id row
+flight.df<-flight.df[,-1]
+x<-colSums(is.na(flight.df))
+#print(x) 
+
+#This shows us that many of our columns now have no null values. All of these will eventually get filtered out for lasso later.
+
+flight.df<- flight.df[, -which(names(flight.df) %in% c("DOT_ID_Reporting_Airline",
+"IATA_CODE_Reporting_Airline",
+"OriginAirportID",
+"OriginAirportSeqID",
+"OriginCityMarketID",
+"OriginStateFips",
+"OriginStateName",
+"OriginWac",
+"DestAirportID",
+"DestAirportSeqID",
+"DestCityMarketID",
+"DestStateFips",
+"DestStateName",
+"DestWac"
+))]
+```
+
+```{r warning=FALSE}
+
+#Here we are removing column(s) where all the values are the same.It's just one for the 2018-2019--a column "Flights" where the value is 1 for every row.
+
+#(R and Fultz, 2019)
+all.same<-vapply(flight.df, function(x) length(unique(x)) > 1, logical(1L))
+flight.df<-subset(flight.df,select=-Flights)
+
+
+
+```
+
+```{r}
+#Here we are calculating columns that do not exist from 2006 data.
+not2006<-colnames(flight.df)[!(colnames(flight.df) %in% colnames(flights.2006))]
+#print(length(not2006))
+#print(not2006)
+```
+
+**
+
+```{r}
+#And now we're looking at columns that are in the 2006 data but not in the 2018 data
+not2018<-colnames(flights.2006)[!(colnames(flights.2006) %in% colnames(flight.df))]
+#print(length(not2018))
+#print(not2018)
+```
+```{r}
+#Now that we have an idea of which columns are "missing," it's clear some of these have just changed names. The code below matches inconsistent column names between 2006 and 2018-2019
+
+
+#Deleting the AirlineID column in 2006 because it is redundant information.
+
+flights.2006<-flights.2006[, -which(names(flights.2006) %in% c("AirlineID"))]
+
+
+#flight.data$Flight_Number_Reporting_Airline %in% flights.2006$FlightNum
+
+colnames(flights.2006)[colnames(flights.2006)=="FlightNum"]<-"Flight_Number_Reporting_Airline"
+
+#flight.data$Tail_Number %in% flights.2006$TailNum
+
+#commenting out as we've realized this is not a useful predictor, and really slows down processing time for lasso
+
+#colnames(flights.2006)[colnames(flights.2006)=="TailNum"]<-"Tail_Number"
+
+
+#flight.data$Reporting_Airline %in% flights.2006$UniqueCarrier
+
+colnames(flights.2006)[colnames(flights.2006)=="UniqueCarrier"]<-"Reporting_Airline"
+```
+
+
+```{r}
+
+#This code was created to merge the MASTER file into our flight.df2 dataset and converting the FlightDate column to a Date.
+
+# MASTER$Tail_Number <- paste('N', MASTER$N.NUMBER, sep="")
+# flight.df2 <- merge(x= flight.df, y = MASTER[, c("Tail_Number", "YEAR.MFR")], by = "Tail_Number", all.x=TRUE)
+# sum(is.na(flight.df2$YEAR.MFR))
+
+flight.df$FlightDate <- as.Date(flight.df$FlightDate , "%m/%d/%Y")
+```
+
+```{r}
+#Creating variables for airline codes and airline names to facilitate data exploration
+
+# airline_codes <- c(unique(flight.df2$Reporting_Airline))
+# airline_names <- c("Allegiant", "Republic", "American","SkyWest", "ExpressJet", "United", "Pinnacle", "JetBlue", "SouthWest", "Frontier", "Comair", "American Eagle","Alaska", "Delta", "Mesa", "Spirit")
+```
+
+```{r}
+
+#We've noticed that there are about 2,000 observations out of our 98,000+ flights where all of the Delay columns (ArrDelay, ArrDelayMinutes, etc.) are NA. Since we can't make any sort of prediction with these data, we are removing them from the dataset.
+
+#(columns et al., 2019)
+
+flight.df2 <- flight.df %>% 
+  filter_at(vars(ArrDelay), any_vars(!is.na(.)))
+
+flight.df2 <- flight.df %>% 
+  filter_at(vars(DepDelay), any_vars(!is.na(.)))
+
+```
+
+```{r cache=TRUE}
+
+
+# flight.df2$ArrAirportDelayState <- ""
+# 
+# time_blocks <- c(unique((flight.df2[order(flight.df2$ArrTimeBlk),])$ArrTimeBlk))
+# 
+# flight.df2$ArrBlockCode <- match(flight.df2$ArrTimeBlk, time_blocks)
+# 
+# for (row in 1:nrow(flight.df2))
+#   {
+#   date_of_row  <- flight.df2[row, "FlightDate"]
+#   block_idx <- flight.df2[row, "ArrBlockCode"]
+#   min_idx <- block_idx - 3
+#   arr_airport <- flight.df2[row, "Dest"]
+# 
+#   if(min_idx > 0){
+#     date.df <- subset(flight.df2, FlightDate==date_of_row & Dest==arr_airport & between(flight.df2$ArrBlockCode, min_idx, block_idx-1))
+#   }
+#   else if(min_idx == -1 || min_idx == 0)
+#   {
+#     date.df <- subset(flight.df2, FlightDate==date_of_row & Dest==arr_airport & between(flight.df2$ArrBlockCode, 1, block_idx-1))
+#   }
+#   else
+#   {
+#     date.df <- subset(flight.df2, FlightDate==date_of_row-1 & Dest==arr_airport & between(flight.df2$ArrBlockCode, 17, 19))
+#   }
+#   flight.df2[row, "ArrAirportDelayState"] <- sum(date.df$ArrDel15)/nrow(date.df)
+#   }
+# 
+# flight.df2 <- transform(flight.df2, ArrAirportDelayState = as.numeric(ArrAirportDelayState))
+```
+
+```{r cache=TRUE}
+# flight.df2$OriginAirportDelayState <- ""
+# 
+# flight.df2$DepBlockCode <- match(flight.df2$DepTimeBlk, time_blocks)
+# 
+# for (row in 1:nrow(flight.df2))
+#   {
+#   date_of_row  <- flight.df2[row, "FlightDate"]
+#   dep_idx <- flight.df2[row, "DepBlockCode"]
+#   dep_min <- dep_idx - 3
+#   origin_airport <- flight.df2[row, "Origin"]
+#   
+#   if(dep_min > 0){
+#     dep.df <- subset(flight.df2, FlightDate==date_of_row & Origin==origin_airport & between(flight.df2$DepBlockCode, dep_min, dep_idx-1))
+#   }
+#   else if(min_idx == -1 || min_idx == 0)
+#   {
+#     dep.df <- subset(flight.df2, FlightDate==date_of_row & Origin==origin_airport & between(flight.df2$DepBlockCode, 1, block_idx-1))
+#   }
+#   else
+#   {
+#     dep.df <- subset(flight.df2, FlightDate==date_of_row-1 & Origin==origin_airport & between(flight.df2$DepBlockCode, 17, 19))
+#   }
+#   flight.df2[row, "OriginAirportDelayState"] <- sum(dep.df$DepDel15)/nrow(dep.df)
+#   }
+# 
+# flight.df2 <- transform(flight.df2, OriginAirportDelayState = as.numeric(OriginAirportDelayState))
+```
+
+```{r cache=TRUE}
+
+#Time Block Variables 2: The Age of ArrTimeBlk
+
+# flight.df2$ArrBlockCode <- match(flight.df2$ArrTimeBlk, time_blocks)
+# flight.df2$PlaneDelayState <- ""
+# 
+# for (row in 1:nrow(flight.df2))
+#   {
+#   date_of_row  <- flight.df2[row, "FlightDate"]
+#   # print(date_of_row)
+#   block_idx <- flight.df2[row, "ArrBlockCode"]
+#   # print(block_idx)
+#   Tail_Num <- flight.df2[row, "Tail_Number"]
+# 
+#   if(block_idx > 1){
+#     tail.df <- subset(flight.df2, FlightDate==date_of_row & Tail_Number==Tail_Num & ArrBlockCode>block_idx)
+#   }
+#   else
+#   {
+#     tail.df <- subset(flight.df2, FlightDate==date_of_row-1 & Tail_Number==Tail_Num & between(flight.df2$ArrBlockCode, 16, 19))
+#   }
+#   flight.df2[row, "PlaneDelayState"] <- sum(tail.df$ArrDel15)/nrow(tail.df)
+#   }
+# 
+# flight.df2 <- transform(flight.df2, PlaneDelayState = as.numeric(PlaneDelayState))
+```
+
+
+```{r cache=TRUE}
+
+# flight.df2$PlaneDelayAvg <- ""
+# 
+# for (row in 1:nrow(flight.df2))
+#   {
+#   date_of_row  <- flight.df2[row, "FlightDate"]
+#   block_idx <- flight.df2[row, "ArrBlockCode"]
+#   Tail_Num <- flight.df2[row, "Tail_Number"]
+# 
+#   if(block_idx > 1){
+#     delay.df <- subset(flight.df2, FlightDate==date_of_row & Tail_Number==Tail_Num & ArrBlockCode>block_idx)
+#     }
+#   else
+#   {
+#     delay.df <- subset(flight.df2, FlightDate==date_of_row-1 & Tail_Number==Tail_Num & between(flight.df2$ArrBlockCode, 16, 19))
+#   }
+#   flight.df2[row, "PlaneDelayAvg"] <- sum(delay.df$ArrDelayMinutes)/nrow(delay.df)
+#   }
+# 
+# flight.df2 <- transform(flight.df2, PlaneDelayAvg = as.numeric(PlaneDelayAvg))
+```
+
+
+```{r}
+
+# flight.df2$PlaneDelayAvg[is.na(flight.df2$PlaneDelayAvg)] <- 0
+# flight.df2$PlaneDelayState[is.na(flight.df2$PlaneDelayState)] <- 0
+# flight.df2$ArrAirportDelayState[is.na(flight.df2$ArrAirportDelayState)] <- 0
+# flight.df2$OriginAirportDelayState[is.na(flight.df2$OriginAirportDelayState)] <- 0
+
+```
+
+
+
+```{r, warning=FALSE,message=FALSE}
+#write.csv(flight.df2, file = "flight.df3.csv")
+flight.df3<-as.data.frame(read_csv("flight.df3.csv", col_names=TRUE))
+flight.df3$X1 <- NULL
+```
+
+
+
+```{r}
+#And now we delete repetative delay variables in anticipation of lasso.
+
+flight.df3<- flight.df3[, -which(names(flight.df3) %in% c("DepTime","DepDelay","DepDelayMinutes","DepartureDelayGroups","ArrDelay","ArrDel15","ArrivalDelayGroups","DepDel15"))]
+```
+
+**In the initial pass at lasso, we realized that PA/Pittsburgh based variables were popping up as statistically significant. This certainly seems like a byproduct of only having flights that either originate or end up in Pittsburgh. Here we are creating groups differentiating between arrivals and departures for further data exploration and model testing.**
+
+```{r}
+flight.df3<- flight.df3 %>% 
+filter_at(vars(ArrDelayMinutes), any_vars(!is.na(.)))
+
+pit.dep<-subset(flight.df3,flight.df3$OriginCityName=="Pittsburgh, PA")
+pit.arr<-subset(flight.df3,flight.df3$DestCityName=="Pittsburgh, PA")
+
+
+#The code below removes DestState, DestCityName, and Dest from Pittsburgh arrivals because these falls are all the same (PA or Pittsburgh)
+
+#This code determines which columns only have one value throughout. The following line delets those columns by name.
+#vapply(pit.arr, function(x) length(unique(x)) > 1, logical(1L))
+ 
+pit.arr<-pit.arr[,-which (names(pit.arr) %in% c("DestState","DestCityName","Dest"))]
+
+# #Doing the same with OriginState, OriginCityName, and Origin for Pittsburgh departures
+
+#Again, deleting columns that just have one value
+#vapply(pit.dep, function(x) length(unique(x)) > 1, logical(1L))
+pit.dep<-pit.dep[,-which (names(pit.dep) %in% c("OriginState","OriginCityName","Origin"))]
+
+```
+
+
+###Exploratory Data Analysis###
+
+**Now we're going to do some exploratory analysis on the variables of interest: ArrTime, WheelsOn,CRSArrTime, and TaxiOut
+
+```{r}
+
+qplot(x=ArrTime,y=ArrDelayMinutes, data=pit.dep,xlab="Arrival Time",ylab="Arrival Delay in Minutes",col=cbPalette[7])
+```
+
+
+**The plot above shows some interesting interactions between the Arrival Delay in Minutes and the actual Arrival Time. The hole in the data between x=250 and x=500 is likely due to a lack of flights scheduled at these hours. We can see that delays seem to increase gradually throughout the day, but it definitely seems that there are two types of delays: ones that occur within a day (from the lower right portion of the plot), and those that likely roll over into the next day (the upper left portion of the plot). Its worth noting the plots for CRSArrTime and WheelsOn, two other variables representing arrival time, had similar graphical results.**
+
+```{r}
+qplot(x=TaxiOut,y=ArrDelayMinutes, data=pit.dep,xlab="Taxi Out Time in Minutes",ylab="Arrival Delay in Minutes")
+```
+**This plot provides some interesting insight about taxi out time. Its worth noting the plot above suggests any flight with a TaxiOut Time>80 will be delayed, which isn't too shocking. For the most part, though, the data almost look as though they exhibit a negative relationship between Taxi Out Time and Arrival Delay in Minutes. However, its more likely that extreme delays of more than 300 minutes are quite rare, and these observations are more likely to be seen where data are highly concentrated on the x-axis.**
+
+```{r}
+summary(pit.dep$TaxiOut)
+```
+
+**This summary confirms that at least 75% of the data have TaxiOut of less than 21 minutes.**
+
+
+###Methodology###
+
+**We decided to look at predictive methods for determing flight arrival delays in minutes. The methods we thought would be most appropriate for this task were lasso for variable selection, regression trees, and linear models.**
+
+###Lasso###
+
+**Here we fit lasso to the Pittsburgh Departures Dataset**
+
+```{r cache=TRUE}
+#Here we are removing Tail_Number due to a considerable processing delay and previous lassos which suggested Tail_Number was not a useful predictor.
+
+pit.dep<-pit.dep[,-which (names(pit.dep) %in% c("Tail_Number"))]
+
+set.seed(1)
+dep.x<-model.matrix(ArrDelayMinutes~.,pit.dep)[,-1]
+dep.y<-pit.dep$ArrDelayMinutes
+dep.lasso<-glmnet(x=dep.x,dep.y,family="gaussian",
+                     alpha=1)
+```
+
+
+
+**Let's take a look at how many lambdas lasso produced for Departures.**
+```{r}
+#dep.lasso$lambda
+
+```
+
+
+**Here we're going to plot the relationship between coefficients and the various values of lambda**
+
+```{r}
+length(dep.lasso$lambda)
+plot(dep.lasso,xvar="norm",label=TRUE)
+```
+
+
+**We have model fits for 100 values of lambda.These values for lambda are helpful, but let's cross-validate all these models to see what selection of variables produces the lowest error.**
+```{r,cache=TRUE}
+dep.lasso.cv<-cv.glmnet(dep.x,dep.y,k=10)
+plot(dep.lasso.cv)
+```
+
+**The graph above shows that a smaller MSE is associated with more negative values of lambda.**
+
+
+**Now that we have cross-validated lasso, we're going to look at the value for minimum CV error.**
+```{r}
+#This is checking what value of lambda minimizes CV error.
+
+mincv <- which(dep.lasso.cv$lambda == dep.lasso.cv$lambda.min)
+
+mincv.error<-dep.lasso.cv$cvm[mincv] 
+#(package?, 2019)
+print(mincv.error)
+
+```
+**The minimum CV error for lasso is 1666.424. But a less complicated model may exist for similar error rates, so lets look at 1-SE**
+
+
+```{r}
+
+#Our value of lambda
+uno.se<-dep.lasso.cv$lambda.1se
+print(uno.se)
+
+#The index of lambda so we can print the error
+dep.1se<-which(dep.lasso.cv$lambda == dep.lasso.cv$lambda.1se)
+
+#Code to print a more compact version of non-zero variables
+grid=10^seq(10,-2,length=100)
+fun<-glmnet(dep.x,dep.y,alpha=1,lambda=grid)
+se.coef<-predict(fun, type="coefficients",s = uno.se)[1:191,]
+se.coef[se.coef!=0]
+
+
+secv.error<-dep.lasso.cv$cvm[dep.1se]
+print(secv.error)
+
+
+```
+
+**The 1-SE CV error for the Pittsburgh Departures model is 1760.095.**
+
+**Now we'll fit lasso to the Pittsburgh Arrivals Dataset**
+
+```{r cache=TRUE}
+
+pit.arr<-pit.arr[,-which (names(pit.arr) %in% c("Tail_Number"))]
+
+set.seed(1)
+arr.x<-model.matrix(ArrDelayMinutes~.,pit.arr)[,-1]
+arr.y<-pit.arr$ArrDelayMinutes
+arr.lasso<-glmnet(x=arr.x,arr.y,family="gaussian",
+                     alpha=1)
+```
+
+
+
+**Let's take a look at how many lambdas lasso produced.**
+```{r}
+#arr.lasso$lambda
+length(arr.lasso$lambda)
+```
+
+**We have model fits for 99 values of lambda.**
+
+
+**Here we're going to plot the relationship between coefficients and the various values of lambda**
+```{r}
+plot(arr.lasso,xvar="norm",label=TRUE)
+```
+
+
+**These values for lambda are helpful, but let's cross-validate all these models to see what selection of variables produces the lowest error.**
+```{r,cache=TRUE}
+arr.lasso.cv<-cv.glmnet(arr.x,arr.y,k=10)
+plot(arr.lasso.cv)
+```
+**The graph above shows MSE for arrivals is lowest when log(Lamda) is more negative.**
+
+
+**We're going to select the value of lambda that produces a less complicated model within 1 standard error of the lambda that minimizes cv.**
+```{r}
+#our lambda value
+
+uno.arr.se<-arr.lasso.cv$lambda.1se
+print(uno.arr.se)
+
+arr.1se<-which(arr.lasso.cv$lambda == arr.lasso.cv$lambda.1se)
+
+#the coefficients selected by lasso to be non-zero
+fun2<-glmnet(arr.x,arr.y,alpha=1,lambda=grid)
+
+se.arr.coef<-predict(fun2, type="coefficients",s = uno.arr.se)[1:191,]
+#se.arr.coef
+se.arr.coef[se.arr.coef!=0]
+
+#error for this model
+arr.secv.error<-arr.lasso.cv$cvm[arr.1se]
+print(arr.secv.error)
+uno.arr.se<-arr.lasso.cv$lambda.1se
+print(uno.arr.se)
+
+```
+**Interestingly, the 1-SE error for Arrivals is lower than Departures at 988. This is somewhat surprising because of the somewhat limited information from variables included and the disparate conditions at origin airports for flights coming to Pittsburgh.**
+
+**Overall, it seems that Pittsburgh arrivals are tougher to predict with the data available. While we have created a model with a lower 1-SE CV error of 1054.845, looking at the variables included it seems unlikely this has much predictive use. If anything, its likely this "predictors" are not predicting delays so much as producing the after-effects of delays which won't be known until after a flight leaves.**
+
+###Regression Trees###
+
+**Now for something completely different. We're going to fit a regression tree model to the pit.dep dataset.**
+
+```{r}
+
+set.seed(1)
+train<-sample(1:nrow(pit.dep),nrow(pit.dep)/2)
+tree.flights<-tree(ArrDelayMinutes~.,pit.dep,subset=train)
+summary(tree.flights)
+```
+**Interestingly enough, the regression tree seems to be taking a very different approach from lasso for the Pittsburgh departures dataset. To explore a little further, here's a breakdown of the rules created by the regression tree.**
+```{r}
+
+tree(formula=ArrDelayMinutes~.,data=pit.dep,subset=train)
+```
+**Here we have a plot of our regression tree.**
+
+```{r}
+
+plot(tree.flights)
+text(tree.flights,pretty=0)
+```
+
+**This doesn't seem particularly useful in predicting flights. WheelsOff Time is close to or the same as most values in CRSDepTime in the dataset. So essentially the only variables being included are departure time, taxi out time, and the created variable ArrAirportDelayState, or the likelihood of recent delays at the arrival airport. **
+```{r}
+#And now let's cross-validate our regression tree.
+
+cv.flights<-cv.tree(tree.flights)
+qplot(x=cv.flights$size,y=cv.flights$dev,xlab="Tree Size",ylab="Deviation")+geom_line(linetype=1,color=cbPalette[4])
+```
+
+**We pruned a tree and plotted it. This has been commented out in the final markdown because it wouldn't knit and it wasn't particularly useful (the largest tree had the lowest deviance)**
+
+```{r}
+
+#prune.flight<-prune.tree(tree.flights,newdata=pit.dep[-train,])
+#pruned<-as.data.frame(cbind(prune.flight$size,prune.flight$dev))
+
+#qplot(data=pruned,x=pruned[,1],y=pruned[,2],xlab="Tree Size",ylab="Deviance")+geom_line(linetype=1,color=cbPalette[3])
+#text(x=pruned[,1],y=pruned[,2],pretty=0)
+
+```
+
+
+**This is code for the plot below. If our model was a perfect predictor, we would see all points along the abline. As we can see, many of the predicted delays are far less than the actual delay experienced.**
+
+```{r}
+yhat<-predict(tree.flights,newdata=pit.dep[-train,])
+flight.test<-pit.dep[-train,"ArrDelayMinutes"]
+qplot(x=yhat,y=flight.test,xlab="Predicted Delay",ylab="Actual Delay")+geom_abline(x=0,y=1)
+tree.mse<-mean((yhat-flight.test)^2)
+sqrt.mse<-sqrt(tree.mse)
+print(sqrt.mse)
+```
+
+**On average, the test predictions for this tree model are within 40.5 minutes of the true delay for each flight departing from Pittsburgh.**
+
+
+
+
+###Key Findings and Questions Answered###
+
+**Our results were somewhat uninsightful when we looked at all flights coming to and from Pittsburgh, largely because variable selection models such as lasso conflated flights leaving Pittsburgh as being likely to cause delays due to overrepresentation in the dataset.**
+
+
+**What features are useful in predicting flight delays?**
+**Things become a little more interesting when we divided the data by arrivals and departures. While the arrival flights variables determined by lasso didn't seem particularly useful, lasso did pick up on some potentially insightful predictors for delyas like certain airlines and destinations.**
+
+
+
+**Can our findings be used to create a personal flight delay warning system?**
+
+
+
+
+
+
+
+**What has changed at PIT airport since 2006?**
+
+
+###Citations###
+*NAs?, H., Rigamonti, L., Cannell, B., O'Hanlon, S. and Jiang, S. (2019). How to delete columns that contain ONLY NAs?. [online] Stack Overflow. Available at: https://stackoverflow.com/questions/15968494/how-to-delete-columns-that-contain-only-nas/15968937 [Accessed 8 May 2019].*
+
+*R, H. and Fultz, N. (2019). How to remove columns with same value in R. [online] Stack Overflow. Available at: https://stackoverflow.com/questions/30544282/how-to-remove-columns-with-same-value-in-r [Accessed 8 May 2019].*
+
+*columns, R., Doe, J., C, L. and Fernandes, T. (2019). R - Remove rows which have all NAs in certain columns. [online] Stack Overflow. Available at: https://stackoverflow.com/questions/51596658/r-remove-rows-which-have-all-nas-in-certain-columns [Accessed 8 May 2019].*
+
+*package?, H. (2019). How to extract the CV errors for optimal lambda using glmnet package?. [online] Stack Overflow. Available at: https://stackoverflow.com/questions/24018585/how-to-extract-the-cv-errors-for-optimal-lambda-using-glmnet-package [Accessed 8 May 2019].*
